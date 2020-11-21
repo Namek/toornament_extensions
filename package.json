@@ -1,0 +1,17 @@
+{
+  "name": "ant_league_toornament",
+  "version": "0.1.0",
+  "description": "",
+  "main": "main.js",
+  "scripts": {
+    "build-win": "pkg --targets win --public --output ant_league_check_lobbies.exe main.js"
+  },
+  "author": "Namek",
+  "license": "ISC",
+  "dependencies": {
+    "colors": "^1.4.0",
+    "dotenv-flow": "^3.2.0",
+    "playwright": "^1.6.2",
+    "yargs": "^16.1.1"
+  }
+}
