@@ -5,6 +5,8 @@ const paths = require('path');
 const { chromium } = require('playwright');
 const yargs = require('yargs');
 
+import type { Browser, Page, BrowserContext } from 'playwright';
+
 const tournamentId = process.env.TOURNAMENT_ID;
 
 if (!process.env.ACCOUNT_USERNAME || !process.env.ACCOUNT_PASSWORD || !tournamentId) {
@@ -13,6 +15,39 @@ if (!process.env.ACCOUNT_USERNAME || !process.env.ACCOUNT_PASSWORD || !tournamen
 
 const datetimePattern = /^\d\d\d\d\-\d\d\-\d\d([T ]\d\d?(:\d\d)?)?$/;
 const datetimeErrorMessage = 'Datetime in format: `YYYY-MM-DD` or `YYYY-MM-DD HH:MM` or empty value to check from beginning.';
+
+
+const state = {
+  paused: false,
+  browser: null as Browser,
+  browserContext: null as BrowserContext,
+  browserPages: [] as Page[],
+};
+
+process.stdin.resume(); // so it doesn't ask whether it should terminate job on CTRL+C
+
+async function exitHandler(options, exitCode) {
+  for (const page of state.browserPages) {
+    await page.close();
+  }
+  state.browserPages.length = 0;
+  await state.browserContext?.close();
+  if (state.browser) await state.browser.close();
+}
+
+process.on('uncaughtException', exitHandler.bind(null, {exit:true}));
+process.on('unhandledRejection', exitHandler.bind(null, {exit:true}));
+
+//do something when app is closing
+process.on('exit', exitHandler.bind(null,{cleanup:true}));
+
+//catches ctrl+c event
+process.on('SIGINT', exitHandler.bind(null, {exit:true}));
+
+// catches "kill pid" (for example: nodemon restart)
+process.on('SIGUSR1', exitHandler.bind(null, {exit:true}));
+process.on('SIGUSR2', exitHandler.bind(null, {exit:true}));
+
 
 (async () => {
   const argv = yargs
@@ -32,6 +67,10 @@ const datetimeErrorMessage = 'Datetime in format: `YYYY-MM-DD` or `YYYY-MM-DD HH
     .option('all-msg-output-file', {
       type: 'string',
       describe: 'path to file where lobbies with ALL messages should be saved to',
+    })
+    .option('pause-on-new-messages-for', {
+      type: 'number',
+      describe: 'number of seconds to automatically pause on current lobby when it contains new messages',
     })
     .check(argv => {
       if (argv.since && !datetimePattern.exec(argv.since)) {
@@ -62,11 +101,12 @@ const datetimeErrorMessage = 'Datetime in format: `YYYY-MM-DD` or `YYYY-MM-DD HH
 
   const sinceDatetime = argv.since ? new Date(argv.since) : null;
 
-  const browser = await chromium.launch({
+  state.browser = await chromium.launch({
     headless: argv.headless,
   });
-  const context = await browser.newContext();
-  const page = await context.newPage();
+  state.browserContext = await state.browser.newContext();
+  const page = await state.browserContext.newPage();
+  state.browserPages.push(page);
 
   async function visitLobby(match) {
     await page.goto(`${match.url}lobby`);
@@ -96,7 +136,7 @@ const datetimeErrorMessage = 'Datetime in format: `YYYY-MM-DD` or `YYYY-MM-DD HH
   }
 
 
-  console.log(`Logging in to https://account.toornament.com/ as ${process.env.ACCOUNT_USERNAME}...`)
+  console.log(`\n\nLogging in to https://account.toornament.com/ as ${process.env.ACCOUNT_USERNAME}...`)
   await page.goto('https://account.toornament.com/en_US/login/')
   await page.click('input[name="_username"]');
   await page.type('input[name="_username"]', process.env.ACCOUNT_USERNAME);
@@ -104,6 +144,25 @@ const datetimeErrorMessage = 'Datetime in format: `YYYY-MM-DD` or `YYYY-MM-DD HH
   await page.type('input[name="_password"]', process.env.ACCOUNT_PASSWORD);
   await page.click('text="Log in"');
 
+  
+  var stdin = process.stdin; 
+  stdin.setRawMode(true);
+  stdin.setEncoding('utf8');
+  stdin.on('data', function(key) {
+    const ch = key.toString();
+
+    if ( ch === '\u0003' ) {
+      // ctrl-c ( end of text )
+      process.exit();
+    } else if (ch === ' ') {
+      state.paused = !state.paused;
+      console.log(state.paused ? 'Paused.\n' : 'Unpaused\n');
+    }
+
+    // write the key to stdout all normal like
+    // process.stdout.write( key );
+  });
+  console.log('You can pause manually with SPACE key.\n');
 
   const firstPageNo = 1;
   let maxPageNo = firstPageNo;
@@ -113,6 +172,10 @@ const datetimeErrorMessage = 'Datetime in format: `YYYY-MM-DD` or `YYYY-MM-DD HH
   const fdAllMessages = argv.allMsgOutputFile ? fs.openSync(argv.allMsgOutputFile, 'w') : null;
 
   for (let i = firstPageNo; i <= maxPageNo; ++i) {
+    while (state.paused) {
+      await sleep(100);
+    }
+
     await page.goto(`https://organizer.toornament.com/tournaments/${tournamentId}/matches/?page=${i}`);
 
     if (i === firstPageNo) {
@@ -129,7 +192,7 @@ const datetimeErrorMessage = 'Datetime in format: `YYYY-MM-DD` or `YYYY-MM-DD HH
     }
 
     // collect matches
-    const matches = await page.$$eval('section.content .card-content .size-content a', $links =>
+    const matches = await page.$$eval('section.content .card-content .size-content a', ($links: HTMLAnchorElement[]) =>
       $links.map($l => ({
         url: $l.href.substring(0, $l.href.indexOf('?')),
         players: [...$l.querySelectorAll('.opponent .name')].map(e => e.textContent)
@@ -137,6 +200,10 @@ const datetimeErrorMessage = 'Datetime in format: `YYYY-MM-DD` or `YYYY-MM-DD HH
     );
 
     for (let match of matches) {
+      while (state.paused) {
+        await sleep(100);
+      }
+
       const messageGroups = await visitLobby(match);
       allMessages.push(messageGroups);
       
@@ -149,10 +216,6 @@ const datetimeErrorMessage = 'Datetime in format: `YYYY-MM-DD` or `YYYY-MM-DD HH
         console.log(match.url);
 
         fdNewMessages && toFile(fdNewMessages, str, match.url);
-      }
-
-      if (messageGroups.length === 0) {
-        fdAllMessages && toFile(fdAllMessages, '  -- No messages here --');
       }
 
       for (const msgGroup of messageGroups) {
@@ -177,10 +240,20 @@ const datetimeErrorMessage = 'Datetime in format: `YYYY-MM-DD` or `YYYY-MM-DD HH
         }
       }
 
+      if (messageGroups.length === 0) {
+        fdAllMessages && toFile(fdAllMessages, '  -- No messages here --');
+      } else if (argv.pauseOnNewMessagesFor) {
+        await sleep(1000 * argv.pauseOnNewMessagesFor);
+      }
+
       fdAllMessages && toFile(fdAllMessages, '')
       if (hasNewMessages) {
         console.log('\n');
         fdNewMessages && toFile(fdNewMessages, '')
+      }
+      
+      while (state.paused) {
+        await sleep(100);
       }
     }
   }
@@ -197,10 +270,6 @@ const datetimeErrorMessage = 'Datetime in format: `YYYY-MM-DD` or `YYYY-MM-DD HH
   
   // Close page
   await page.close();
-
-  // ---------------------
-  await context.close();
-  await browser.close();
 })();
 
 function testFileSave(path) {
@@ -235,3 +304,5 @@ function toFile(fileDescriptor, ...lines) {
     fs.writeSync(fileDescriptor, '\r\n');
   }
 }
+
+const sleep = (waitTimeInMs) => new Promise(resolve => setTimeout(resolve, waitTimeInMs));
